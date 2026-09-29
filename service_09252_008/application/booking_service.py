@@ -23,6 +23,7 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..domain.models import (
+    ACTIVE_PART_STATUSES,
     CANCELLABLE_STATUSES,
     LOSS_CANCEL_AFTER_SHIPMENT,
     LOSS_DAMAGED_IN_USE,
@@ -43,6 +44,8 @@ from ..domain.models import (
     ReceptionWindow,
     Settlement,
     Shipment,
+    ShipmentPart,
+    ShipmentPartStatus,
     ShipmentStatus,
     WorkshopResource,
     dt_to_str,
@@ -64,7 +67,12 @@ from .catalog_service import (
     COLLECTION_RESOURCES,
     COLLECTION_WINDOWS,
 )
-from .ports import Clock, IdGenerator
+from .ports import (
+    Clock,
+    IdGenerator,
+    TrackingNumberGenerator,
+    UuidTrackingNumberGenerator,
+)
 
 COLLECTION_BOOKINGS = "bookings"
 COLLECTION_RESERVATIONS = "material_reservations"
@@ -92,6 +100,7 @@ class BookingService:
         store: Store,
         clock: Clock,
         ids: IdGenerator,
+        tracking_numbers: TrackingNumberGenerator | None = None,
         *,
         lock_ttl_seconds: int = DEFAULT_LOCK_TTL_SECONDS,
         quote_ttl_seconds: int = DEFAULT_QUOTE_TTL_SECONDS,
@@ -99,6 +108,7 @@ class BookingService:
         self._store = store
         self._clock = clock
         self._ids = ids
+        self._tracking_numbers = tracking_numbers or UuidTrackingNumberGenerator()
         self._lock_ttl = lock_ttl_seconds
         self._quote_ttl = quote_ttl_seconds
 
@@ -213,6 +223,27 @@ class BookingService:
 
     def _shipments_of(self, booking_id: str) -> list[Shipment]:
         return [Shipment.from_dict(s) for s in self._store.query(COLLECTION_SHIPMENTS, booking_id=booking_id)]
+
+    def _load_shipment(self, shipment_id: str) -> Shipment:
+        record = self._store.get(COLLECTION_SHIPMENTS, shipment_id)
+        if record is None:
+            raise NotFoundError(
+                f"shipment not found: {shipment_id}", details={"shipment_id": shipment_id}
+            )
+        return Shipment.from_dict(record)
+
+    def _save_shipment(self, shipment: Shipment) -> None:
+        shipment.roll_up()
+        self._store.put(COLLECTION_SHIPMENTS, shipment.shipment_id, shipment.to_dict())
+
+    def _reservation_for(self, booking_id: str, batch_id: str) -> MaterialReservation | None:
+        for reservation in self._reservations_of(booking_id):
+            if reservation.batch_id == batch_id:
+                return reservation
+        return None
+
+    def _save_reservation(self, reservation: MaterialReservation) -> None:
+        self._store.put(COLLECTION_RESERVATIONS, reservation.reservation_id, reservation.to_dict())
 
     def _window_bookings(self, window_id: str) -> list[Booking]:
         return [Booking.from_dict(b) for b in self._store.query(COLLECTION_BOOKINGS, window_id=window_id)]
@@ -517,10 +548,10 @@ class BookingService:
         request = request or {}
         key = request.get("idempotency_key")
         return self._idempotent(
-            "ship", key, {"booking_id": booking_id, **request}, lambda: self._ship(booking_id), required=True
+            "ship", key, {"booking_id": booking_id, **request}, lambda: self._ship(booking_id, request), required=True
         )
 
-    def _ship(self, booking_id: str) -> dict[str, Any]:
+    def _ship(self, booking_id: str, request: dict[str, Any]) -> dict[str, Any]:
         now = self._clock.now()
         booking = self._load_booking(booking_id)
         if booking.status != BookingStatus.LOCKED:
@@ -530,39 +561,104 @@ class BookingService:
             )
         if booking.lock_expires_at is None or booking.lock_expires_at <= now:
             raise StateError("lock has expired; recover timeouts before shipping", details={"booking_id": booking_id})
+
+        reservations = [r for r in self._reservations_of(booking_id) if r.outstanding_reserved > QTY_EPS]
+        if not reservations:
+            raise StateError("nothing to ship for this booking", details={"booking_id": booking_id})
+        splits = self._build_ship_splits(request.get("parts"), reservations)
+
         shipments: list[Shipment] = []
-        for reservation in self._reservations_of(booking_id):
-            outstanding = reservation.outstanding_reserved
-            if outstanding <= QTY_EPS:
-                continue
+        for reservation in reservations:
             batch = self._load_batch(reservation.batch_id)
+            shipment_id = self._ids.new_id("shp")
+            quantities = splits.get(reservation.batch_id, [reservation.outstanding_reserved])
+            parts: list[ShipmentPart] = []
+            for quantity in quantities:
+                parts.append(
+                    ShipmentPart(
+                        part_id=self._ids.new_id("prt"),
+                        tracking_number=self._tracking_numbers.new_tracking_number(shipment_id, 1),
+                        quantity=round(quantity, 6),
+                        shipped_at=now,
+                        eta=now + timedelta(seconds=batch.lead_time_seconds),
+                    )
+                )
+            total = round(sum(quantities), 6)
             shipment = Shipment(
-                shipment_id=self._ids.new_id("shp"),
+                shipment_id=shipment_id,
                 booking_id=booking_id,
                 batch_id=batch.batch_id,
                 material_id=batch.material_id,
-                quantity=outstanding,
+                quantity=total,
                 shipped_at=now,
                 eta=now + timedelta(seconds=batch.lead_time_seconds),
+                parts=parts,
             )
-            reservation.quantity_shipped = round(reservation.quantity_shipped + outstanding, 6)
-            self._store.put(COLLECTION_RESERVATIONS, reservation.reservation_id, reservation.to_dict())
-            self._store.put(COLLECTION_SHIPMENTS, shipment.shipment_id, shipment.to_dict())
+            self._save_shipment(shipment)
+            reservation.quantity_shipped = round(reservation.quantity_shipped + total, 6)
+            self._save_reservation(reservation)
             shipments.append(shipment)
-        if not shipments:
-            raise StateError("nothing to ship for this booking", details={"booking_id": booking_id})
         booking.status = BookingStatus.SHIPPED
         booking.lock_expires_at = None
         self._save_booking(booking)
         self._emit(
             "materials_shipped",
             booking_id,
-            {"shipment_ids": [s.shipment_id for s in shipments]},
+            {
+                "shipment_ids": [s.shipment_id for s in shipments],
+                "parts": [
+                    {"shipment_id": s.shipment_id, "part_id": p.part_id, "tracking_number": p.tracking_number}
+                    for s in shipments
+                    for p in s.parts
+                ],
+            },
         )
         return self._booking_view(booking)
 
+    def _build_ship_splits(
+        self,
+        raw_parts: Any,
+        reservations: list[MaterialReservation],
+    ) -> dict[str, list[float]]:
+        """解析并校验拆批载荷：每个批次可拆成若干正数数量，合计须等于待发运量。"""
+        outstanding = {r.batch_id: round(r.outstanding_reserved, 6) for r in reservations}
+        if raw_parts is None:
+            return {batch_id: [quantity] for batch_id, quantity in outstanding.items()}
+        if not isinstance(raw_parts, list) or not raw_parts:
+            raise ValidationError("field parts must be a non-empty list of {batch_id, quantity}")
+        splits: dict[str, list[float]] = {}
+        for item in raw_parts:
+            if not isinstance(item, dict):
+                raise ValidationError("each shipping part must be an object {batch_id, quantity}")
+            batch_id = item.get("batch_id")
+            if not isinstance(batch_id, str) or not batch_id.strip():
+                raise ValidationError("each shipping part requires a non-empty batch_id")
+            quantity = item.get("quantity")
+            if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or float(quantity) <= 0:
+                raise ValidationError("each shipping part quantity must be a positive number")
+            if batch_id not in outstanding:
+                raise ValidationError(
+                    "part references a batch without outstanding reservation",
+                    details={"batch_id": batch_id},
+                )
+            splits.setdefault(batch_id, []).append(float(quantity))
+        for batch_id, quantities in splits.items():
+            total = round(sum(quantities), 6)
+            if abs(total - outstanding[batch_id]) > QTY_EPS:
+                raise ValidationError(
+                    "part quantities must sum to the outstanding reserved quantity",
+                    details={"batch_id": batch_id, "expected": outstanding[batch_id], "actual": total},
+                )
+        missing = [batch_id for batch_id in outstanding if batch_id not in splits]
+        if missing:
+            raise ValidationError(
+                "parts must cover every batch with outstanding reservation",
+                details={"missing_batch_ids": missing},
+            )
+        return splits
+
     def record_arrival(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
-        """登记到货，支持部分到货。"""
+        """登记某个追踪批次的到货，支持部分到货；其余批次不受影响。"""
         key = request.get("idempotency_key")
         return self._idempotent(
             "record_arrival",
@@ -572,44 +668,200 @@ class BookingService:
             required=False,
         )
 
-    def _record_arrival(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
-        record = self._store.get(COLLECTION_SHIPMENTS, shipment_id)
-        if record is None:
-            raise NotFoundError(f"shipment not found: {shipment_id}", details={"shipment_id": shipment_id})
-        shipment = Shipment.from_dict(record)
-        if shipment.status not in (ShipmentStatus.IN_TRANSIT, ShipmentStatus.PARTIALLY_ARRIVED):
+    def _select_active_part(self, shipment: Shipment, request: dict[str, Any]) -> ShipmentPart:
+        part_id = request.get("part_id")
+        tracking = request.get("tracking_number")
+        if part_id is not None or tracking is not None:
+            part = shipment.find_part(part_id=part_id, tracking_number=tracking)
+            if part is None:
+                raise NotFoundError(
+                    "shipping part not found on this shipment",
+                    details={"shipment_id": shipment.shipment_id, "part_id": part_id, "tracking_number": tracking},
+                )
+            if part.status not in ACTIVE_PART_STATUSES:
+                raise StateError(
+                    "shipping part is not accepting arrivals",
+                    details={"part_id": part.part_id, "status": part.status.value},
+                )
+            return part
+        active = shipment.active_parts()
+        if not active:
             raise StateError(
-                "shipment is already closed",
-                details={"shipment_id": shipment_id, "status": shipment.status.value},
+                "no shipping part is in transit for this shipment",
+                details={"shipment_id": shipment.shipment_id},
             )
+        if len(active) > 1:
+            raise ValidationError(
+                "shipment has multiple in-transit parts; specify part_id or tracking_number",
+                details={"part_ids": [p.part_id for p in active]},
+            )
+        return active[0]
+
+    def _record_arrival(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        shipment = self._load_shipment(shipment_id)
+        part = self._select_active_part(shipment, request)
         quantity = request.get("quantity")
         if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or float(quantity) <= 0:
             raise ValidationError("field quantity must be a positive number")
         quantity = float(quantity)
-        if quantity > shipment.remaining + QTY_EPS:
+        if quantity > part.remaining + QTY_EPS:
             raise ValidationError(
-                "arrival quantity exceeds shipment remainder",
-                details={"remaining": shipment.remaining, "quantity": quantity},
+                "arrival quantity exceeds this part's remainder",
+                details={"part_id": part.part_id, "remaining": part.remaining, "quantity": quantity},
             )
-        shipment.arrived_quantity = round(shipment.arrived_quantity + quantity, 6)
-        shipment.status = (
-            ShipmentStatus.ARRIVED if shipment.remaining <= QTY_EPS else ShipmentStatus.PARTIALLY_ARRIVED
+        part.arrived_quantity = round(part.arrived_quantity + quantity, 6)
+        part.status = (
+            ShipmentPartStatus.ARRIVED if part.remaining <= QTY_EPS else ShipmentPartStatus.PARTIALLY_ARRIVED
         )
-        self._store.put(COLLECTION_SHIPMENTS, shipment.shipment_id, shipment.to_dict())
-        for reservation in self._reservations_of(shipment.booking_id):
-            if reservation.batch_id == shipment.batch_id:
-                reservation.quantity_arrived = round(reservation.quantity_arrived + quantity, 6)
-                self._store.put(COLLECTION_RESERVATIONS, reservation.reservation_id, reservation.to_dict())
-                break
+        self._save_shipment(shipment)
+        reservation = self._reservation_for(shipment.booking_id, shipment.batch_id)
+        if reservation is not None:
+            reservation.quantity_arrived = round(reservation.quantity_arrived + quantity, 6)
+            self._save_reservation(reservation)
         self._emit(
-            "shipment_partially_arrived" if shipment.status == ShipmentStatus.PARTIALLY_ARRIVED else "shipment_arrived",
+            "shipment_partially_arrived"
+            if shipment.status == ShipmentStatus.PARTIALLY_ARRIVED
+            else "shipment_arrived",
             shipment.booking_id,
-            {"shipment_id": shipment_id, "quantity": quantity},
+            {
+                "shipment_id": shipment_id,
+                "part_id": part.part_id,
+                "tracking_number": part.tracking_number,
+                "quantity": quantity,
+            },
+        )
+        return self._booking_view(self._load_booking(shipment.booking_id))
+
+    def report_part_failure(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """仓储人员上报某个追踪批次发运失败（丢件/退件），等待单独重试。"""
+        key = request.get("idempotency_key")
+        return self._idempotent(
+            "report_part_failure",
+            key,
+            {"shipment_id": shipment_id, **request},
+            lambda: self._report_part_failure(shipment_id, request),
+            required=True,
+        )
+
+    def _report_part_failure(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        shipment = self._load_shipment(shipment_id)
+        part = self._select_part_for_retry(shipment, request)
+        if part.status not in ACTIVE_PART_STATUSES:
+            raise StateError(
+                "only an in-transit part can be marked failed",
+                details={"part_id": part.part_id, "status": part.status.value},
+            )
+        part.status = ShipmentPartStatus.FAILED
+        self._save_shipment(shipment)
+        self._emit(
+            "shipment_part_failed",
+            shipment.booking_id,
+            {
+                "shipment_id": shipment_id,
+                "part_id": part.part_id,
+                "tracking_number": part.tracking_number,
+                "remaining": part.remaining,
+                "reason": request.get("reason"),
+            },
+        )
+        return self._booking_view(self._load_booking(shipment.booking_id))
+
+    def _select_part_for_loss(self, shipment: Shipment, request: dict[str, Any]) -> ShipmentPart:
+        """损耗可登记到在途批，或显式登记到失败批（确认灭失、不再补发）。"""
+        part_id = request.get("part_id")
+        tracking = request.get("tracking_number")
+        if part_id is not None or tracking is not None:
+            part = shipment.find_part(part_id=part_id, tracking_number=tracking)
+            if part is None:
+                raise NotFoundError(
+                    "shipping part not found on this shipment",
+                    details={"shipment_id": shipment.shipment_id, "part_id": part_id, "tracking_number": tracking},
+                )
+            if part.status not in ACTIVE_PART_STATUSES and part.status != ShipmentPartStatus.FAILED:
+                raise StateError(
+                    "shipping part is already closed",
+                    details={"part_id": part.part_id, "status": part.status.value},
+                )
+            if part.superseded_by is not None:
+                raise StateError(
+                    "shipping part was superseded by a retry; record loss on the retry part",
+                    details={"part_id": part.part_id, "superseded_by": part.superseded_by},
+                )
+            return part
+        return self._select_active_part(shipment, request)
+
+    def _select_part_for_retry(self, shipment: Shipment, request: dict[str, Any]) -> ShipmentPart:
+        part_id = request.get("part_id")
+        tracking = request.get("tracking_number")
+        if part_id is None and tracking is None:
+            raise ValidationError("part_id or tracking_number is required")
+        part = shipment.find_part(part_id=part_id, tracking_number=tracking)
+        if part is None:
+            raise NotFoundError(
+                "shipping part not found on this shipment",
+                details={"shipment_id": shipment.shipment_id, "part_id": part_id, "tracking_number": tracking},
+            )
+        return part
+
+    def retry_part(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """对单个失败批次独立重试：旧批次保留审计痕迹，新批次获得新追踪号。
+
+        失败批次若已有部分到货，仅重试其剩余量；整批失败则整量重发。
+        """
+        key = request.get("idempotency_key")
+        return self._idempotent(
+            "retry_part",
+            key,
+            {"shipment_id": shipment_id, **request},
+            lambda: self._retry_part(shipment_id, request),
+            required=True,
+        )
+
+    def _retry_part(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        now = self._clock.now()
+        shipment = self._load_shipment(shipment_id)
+        failed = self._select_part_for_retry(shipment, request)
+        if failed.status != ShipmentPartStatus.FAILED:
+            raise StateError(
+                "only a FAILED part can be retried",
+                details={"part_id": failed.part_id, "status": failed.status.value},
+            )
+        retry_quantity = round(failed.remaining, 6)
+        if retry_quantity <= QTY_EPS:
+            raise StateError(
+                "failed part has no quantity left to retry",
+                details={"part_id": failed.part_id},
+            )
+        batch = self._load_batch(shipment.batch_id)
+        attempt = max(p.attempt for p in shipment.parts) + 1
+        new_part = ShipmentPart(
+            part_id=self._ids.new_id("prt"),
+            tracking_number=self._tracking_numbers.new_tracking_number(shipment_id, attempt),
+            quantity=retry_quantity,
+            shipped_at=now,
+            eta=now + timedelta(seconds=batch.lead_time_seconds),
+            attempt=attempt,
+        )
+        failed.superseded_by = new_part.part_id
+        shipment.parts.append(new_part)
+        self._save_shipment(shipment)
+        self._emit(
+            "shipment_part_retried",
+            shipment.booking_id,
+            {
+                "shipment_id": shipment_id,
+                "failed_part_id": failed.part_id,
+                "failed_tracking_number": failed.tracking_number,
+                "new_part_id": new_part.part_id,
+                "new_tracking_number": new_part.tracking_number,
+                "quantity": retry_quantity,
+                "attempt": attempt,
+            },
         )
         return self._booking_view(self._load_booking(shipment.booking_id))
 
     def record_shipment_loss(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
-        """登记在途损耗；剩余全部灭失时关闭发运单。"""
+        """登记某个追踪批次的在途损耗；剩余全部灭失时关闭该批与发运单。"""
         key = request.get("idempotency_key")
         return self._idempotent(
             "record_shipment_loss",
@@ -620,33 +872,25 @@ class BookingService:
         )
 
     def _record_shipment_loss(self, shipment_id: str, request: dict[str, Any]) -> dict[str, Any]:
-        record = self._store.get(COLLECTION_SHIPMENTS, shipment_id)
-        if record is None:
-            raise NotFoundError(f"shipment not found: {shipment_id}", details={"shipment_id": shipment_id})
-        shipment = Shipment.from_dict(record)
-        if shipment.status not in (ShipmentStatus.IN_TRANSIT, ShipmentStatus.PARTIALLY_ARRIVED):
-            raise StateError(
-                "shipment is already closed",
-                details={"shipment_id": shipment_id, "status": shipment.status.value},
-            )
-        quantity = request.get("quantity", shipment.remaining)
+        shipment = self._load_shipment(shipment_id)
+        part = self._select_part_for_loss(shipment, request)
+        quantity = request.get("quantity", part.remaining)
         if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or float(quantity) <= 0:
             raise ValidationError("field quantity must be a positive number")
         quantity = float(quantity)
-        if quantity > shipment.remaining + QTY_EPS:
+        if quantity > part.remaining + QTY_EPS:
             raise ValidationError(
-                "loss quantity exceeds shipment remainder",
-                details={"remaining": shipment.remaining, "quantity": quantity},
+                "loss quantity exceeds this part's remainder",
+                details={"part_id": part.part_id, "remaining": part.remaining, "quantity": quantity},
             )
-        shipment.lost_quantity = round(shipment.lost_quantity + quantity, 6)
-        if shipment.remaining <= QTY_EPS:
-            shipment.status = ShipmentStatus.CLOSED_WITH_LOSS
-        self._store.put(COLLECTION_SHIPMENTS, shipment.shipment_id, shipment.to_dict())
-        for reservation in self._reservations_of(shipment.booking_id):
-            if reservation.batch_id == shipment.batch_id:
-                reservation.quantity_lost = round(reservation.quantity_lost + quantity, 6)
-                self._store.put(COLLECTION_RESERVATIONS, reservation.reservation_id, reservation.to_dict())
-                break
+        part.lost_quantity = round(part.lost_quantity + quantity, 6)
+        if part.remaining <= QTY_EPS:
+            part.status = ShipmentPartStatus.CLOSED_WITH_LOSS
+        self._save_shipment(shipment)
+        reservation = self._reservation_for(shipment.booking_id, shipment.batch_id)
+        if reservation is not None:
+            reservation.quantity_lost = round(reservation.quantity_lost + quantity, 6)
+            self._save_reservation(reservation)
         self._record_loss(
             booking_id=shipment.booking_id,
             batch_id=shipment.batch_id,
@@ -900,12 +1144,20 @@ class BookingService:
                     reason=LOSS_CANCEL_AFTER_SHIPMENT,
                 )
             self._store.put(COLLECTION_RESERVATIONS, reservation.reservation_id, reservation.to_dict())
-        # 关闭仍在途的发运单
+        # 关闭仍未终结的分批：在途批与未被重试取代的失败批，其剩余记损耗；
+        # 已被新批次取代（superseded_by）的失败批，剩余量由后继批次承担，不重复计。
         for shipment in self._shipments_of(booking.booking_id):
-            if not shipment.closed:
-                shipment.status = ShipmentStatus.CLOSED_WITH_LOSS
-                shipment.lost_quantity = round(shipment.lost_quantity + shipment.remaining, 6)
-                self._store.put(COLLECTION_SHIPMENTS, shipment.shipment_id, shipment.to_dict())
+            changed = False
+            for part in shipment.parts:
+                if part.terminal or part.superseded_by is not None:
+                    continue
+                remaining = part.remaining
+                if remaining > QTY_EPS:
+                    part.lost_quantity = round(part.lost_quantity + remaining, 6)
+                part.status = ShipmentPartStatus.CLOSED_WITH_LOSS
+                changed = True
+            if changed:
+                self._save_shipment(shipment)
 
     def _promote_waitlist(self, window_id: str) -> None:
         """按申请先后顺序释放候补：容量与互斥均满足者晋级为 REQUESTED。"""
@@ -1000,13 +1252,46 @@ class BookingService:
         booking = self._load_booking(booking_id)
         return self._booking_view(booking)
 
+    def get_shipment(self, shipment_id: str) -> dict[str, Any]:
+        """单批发运单视图：各追踪批次状态与汇总到货。"""
+        shipment = self._load_shipment(shipment_id)
+        return self._shipment_view(shipment)
+
     def list_bookings(self, **filters: Any) -> list[dict[str, Any]]:
         return [self._booking_view(Booking.from_dict(b)) for b in self._store.query(COLLECTION_BOOKINGS, **filters)]
+
+    def _shipment_view(self, shipment: Shipment) -> dict[str, Any]:
+        view = shipment.to_dict()
+        view["arrival_summary"] = {
+            "quantity": shipment.quantity,
+            "arrived_quantity": shipment.arrived_quantity,
+            "lost_quantity": shipment.lost_quantity,
+            "in_transit_quantity": round(
+                sum(
+                    p.remaining
+                    for p in shipment.parts
+                    if p.status in ACTIVE_PART_STATUSES
+                ),
+                6,
+            ),
+            "failed_quantity": round(
+                sum(
+                    p.remaining
+                    for p in shipment.parts
+                    if p.status == ShipmentPartStatus.FAILED and p.superseded_by is None
+                ),
+                6,
+            ),
+            "part_count": len(shipment.parts),
+        }
+        return view
 
     def _booking_view(self, booking: Booking) -> dict[str, Any]:
         view = booking.to_dict()
         view["reservations"] = [r.to_dict() for r in self._reservations_of(booking.booking_id)]
-        view["shipments"] = [s.to_dict() for s in self._shipments_of(booking.booking_id)]
+        shipments = self._shipments_of(booking.booking_id)
+        view["shipments"] = [self._shipment_view(s) for s in shipments]
+        view["arrival_summary"] = self._arrival_summary_from(shipments)
         settlements = self._store.query(COLLECTION_SETTLEMENTS, booking_id=booking.booking_id)
         view["settlement"] = settlements[0] if settlements else None
         losses = self._store.query(COLLECTION_LOSSES, booking_id=booking.booking_id)
@@ -1023,3 +1308,53 @@ class BookingService:
             ]
             view["waitlist_position"] = len(ahead) + 1
         return view
+
+    def _arrival_summary_from(self, shipments: list[Shipment]) -> dict[str, Any]:
+        summary = {
+            "shipment_count": len(shipments),
+            "part_count": sum(len(s.parts) for s in shipments),
+            "open_shipment_ids": [s.shipment_id for s in shipments if not s.closed],
+            "by_material": [],
+            "totals": {},
+        }
+        by_material: dict[str, dict[str, Any]] = {}
+        totals = {
+            "shipped_quantity": 0.0,
+            "arrived_quantity": 0.0,
+            "lost_quantity": 0.0,
+            "in_transit_quantity": 0.0,
+            "failed_quantity": 0.0,
+        }
+        for shipment in shipments:
+            row = by_material.setdefault(
+                shipment.material_id,
+                {"material_id": shipment.material_id, "shipped_quantity": 0.0, "arrived_quantity": 0.0,
+                 "lost_quantity": 0.0, "in_transit_quantity": 0.0, "failed_quantity": 0.0},
+            )
+            in_transit = round(
+                sum(p.remaining for p in shipment.parts if p.status in ACTIVE_PART_STATUSES), 6
+            )
+            failed = round(
+                sum(
+                    p.remaining
+                    for p in shipment.parts
+                    if p.status == ShipmentPartStatus.FAILED and p.superseded_by is None
+                ),
+                6,
+            )
+            deltas = {
+                "shipped_quantity": shipment.quantity,
+                "arrived_quantity": shipment.arrived_quantity,
+                "lost_quantity": shipment.lost_quantity,
+                "in_transit_quantity": in_transit,
+                "failed_quantity": failed,
+            }
+            for key, value in deltas.items():
+                row[key] = round(row[key] + value, 6)
+                totals[key] = round(totals[key] + value, 6)
+        summary["by_material"] = [by_material[key] for key in sorted(by_material)]
+        summary["totals"] = totals
+        summary["all_arrived"] = (
+            bool(shipments) and not summary["open_shipment_ids"] and totals["lost_quantity"] <= QTY_EPS
+        )
+        return summary

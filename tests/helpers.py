@@ -6,7 +6,11 @@ from typing import Any
 
 from service_09252_008.application.booking_service import BookingService
 from service_09252_008.application.catalog_service import CatalogService
-from service_09252_008.application.ports import ManualClock, SequentialIdGenerator
+from service_09252_008.application.ports import (
+    ManualClock,
+    SequentialIdGenerator,
+    SequentialTrackingNumberGenerator,
+)
 from service_09252_008.persistence.store import InMemoryStore, Store
 
 NOW = datetime(2026, 9, 25, 0, 0, 0, tzinfo=timezone.utc)
@@ -27,8 +31,16 @@ def make_services(
     store = store or InMemoryStore()
     clock = ManualClock(now)
     ids = SequentialIdGenerator()
+    tracking = SequentialTrackingNumberGenerator()
     catalog = CatalogService(store, clock, ids)
-    bookings = BookingService(store, clock, ids, lock_ttl_seconds=lock_ttl_seconds, quote_ttl_seconds=quote_ttl_seconds)
+    bookings = BookingService(
+        store,
+        clock,
+        ids,
+        tracking,
+        lock_ttl_seconds=lock_ttl_seconds,
+        quote_ttl_seconds=quote_ttl_seconds,
+    )
     return catalog, bookings, clock, store
 
 

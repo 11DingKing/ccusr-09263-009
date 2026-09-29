@@ -112,6 +112,82 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn("expired_locks", body)
         self.assertIn("expired_quotes", body)
 
+    def test_split_shipment_failure_and_retry_over_http(self) -> None:
+        apply_body = {
+            "institution": "仓储职业学院",
+            "package_id": self.ids["package_id"],
+            "mentor_id": self.ids["mentor_id"],
+            "resource_id": self.ids["resource_id"],
+            "window_id": self.ids["window_id"],
+            "seats": 4,
+            "slot_start": "2026-10-01T06:00:00+00:00",
+            "slot_end": "2026-10-01T08:00:00+00:00",
+        }
+        status, applied = self._request(
+            "POST", "/bookings", apply_body, headers={"Idempotency-Key": "http-split-apply"}
+        )
+        self.assertEqual(status, 201)
+        booking_id = applied["booking_id"]
+        self.assertEqual(applied["status"], "REQUESTED")
+        self._request("POST", f"/bookings/{booking_id}/quote", {})
+        self._request("POST", f"/bookings/{booking_id}/lock", {}, headers={"Idempotency-Key": "http-split-lock"})
+
+        # 染料 2.0 拆两批
+        status, shipped = self._request(
+            "POST",
+            f"/bookings/{booking_id}/ship",
+            {
+                "parts": [
+                    {"batch_id": self.ids["dye_batch_id"], "quantity": 1.0},
+                    {"batch_id": self.ids["dye_batch_id"], "quantity": 1.0},
+                    {"batch_id": self.ids["cloth_batch_id"], "quantity": 4.0},
+                ]
+            },
+            headers={"Idempotency-Key": "http-split-ship"},
+        )
+        self.assertEqual(status, 200)
+        dye = next(s for s in shipped["shipments"] if s["material_id"] == "dye")
+        self.assertEqual(len(dye["parts"]), 2)
+        bad_part, good_part = dye["parts"][0], dye["parts"][1]
+
+        # 多批在途时不指定批次到货 -> 400
+        status, body = self._request("POST", f"/shipments/{dye['shipment_id']}/arrivals", {"quantity": 1.0})
+        self.assertEqual(status, 400)
+
+        # 第一批失败，第二批正常到货
+        status, failed = self._request(
+            "POST",
+            f"/shipments/{dye['shipment_id']}/failures",
+            {"part_id": bad_part["part_id"], "reason": "丢件"},
+            headers={"Idempotency-Key": "http-split-fail"},
+        )
+        self.assertEqual(status, 200)
+        failed_part = next(
+            p for s in failed["shipments"] if s["shipment_id"] == dye["shipment_id"] for p in s["parts"]
+            if p["part_id"] == bad_part["part_id"]
+        )
+        self.assertEqual(failed_part["status"], "FAILED")
+
+        # 单独重试失败批
+        status, retried = self._request(
+            "POST",
+            f"/shipments/{dye['shipment_id']}/retries",
+            {"part_id": bad_part["part_id"]},
+            headers={"Idempotency-Key": "http-split-retry"},
+        )
+        self.assertEqual(status, 200)
+        new_part = next(
+            p for s in retried["shipments"] if s["shipment_id"] == dye["shipment_id"] for p in s["parts"]
+            if p["attempt"] == 2
+        )
+        self.assertEqual(new_part["quantity"], 1.0)
+        self.assertNotEqual(new_part["tracking_number"], bad_part["tracking_number"])
+
+        # 单批发运单查询
+        status, shipment_view = self._request("GET", f"/shipments/{dye['shipment_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(shipment_view["arrival_summary"]["part_count"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -100,6 +100,20 @@ class ShipmentStatus(str, Enum):
     CLOSED_WITH_LOSS = "CLOSED_WITH_LOSS"  # 剩余记损耗后关闭
 
 
+class ShipmentPartStatus(str, Enum):
+    """分批发运中“一批”的状态：失败批次可由重试批次取代。"""
+
+    IN_TRANSIT = "IN_TRANSIT"  # 在途（可登记到货/失败）
+    PARTIALLY_ARRIVED = "PARTIALLY_ARRIVED"  # 该批已有部分到货
+    ARRIVED = "ARRIVED"  # 全部到货（终态）
+    FAILED = "FAILED"  # 发运失败，等待单独重试
+    CLOSED_WITH_LOSS = "CLOSED_WITH_LOSS"  # 在途损耗确认后关闭（终态）
+
+
+#: 仍可登记到货/损耗的分批状态
+ACTIVE_PART_STATUSES = frozenset({ShipmentPartStatus.IN_TRANSIT, ShipmentPartStatus.PARTIALLY_ARRIVED})
+
+
 #: 损耗原因
 LOSS_CANCEL_AFTER_SHIPMENT = "cancel_after_shipment"  # 发运后取消
 LOSS_IN_TRANSIT = "in_transit_loss"  # 在途灭失
@@ -497,8 +511,76 @@ class MaterialReservation:
 
 
 @dataclass
+class ShipmentPart:
+    """材料分批发运中的“一批”：持有独立追踪号与状态。
+
+    一批发运失败（如承运商丢件、退件）时状态置为 ``FAILED``，
+    可由一次独立重试产生新的批次；旧批次以 ``superseded_by`` 记录
+    取代它的新批次，形成可审计的重试链。
+    """
+
+    part_id: str
+    tracking_number: str
+    quantity: float
+    shipped_at: datetime
+    eta: datetime
+    arrived_quantity: float = 0.0
+    lost_quantity: float = 0.0
+    attempt: int = 1
+    status: ShipmentPartStatus = ShipmentPartStatus.IN_TRANSIT
+    superseded_by: str | None = None
+
+    @property
+    def remaining(self) -> float:
+        """该批尚未到货/未确认损耗的数量（失败时仍计入，等待重试）。"""
+        return self.quantity - self.arrived_quantity - self.lost_quantity
+
+    @property
+    def terminal(self) -> bool:
+        return self.status in (ShipmentPartStatus.ARRIVED, ShipmentPartStatus.CLOSED_WITH_LOSS)
+
+    @property
+    def resolved(self) -> bool:
+        """该批的数量是否已了结：自身终结，或剩余量已移交重试批次。"""
+        return self.terminal or self.superseded_by is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "part_id": self.part_id,
+            "tracking_number": self.tracking_number,
+            "quantity": self.quantity,
+            "shipped_at": dt_to_str(self.shipped_at),
+            "eta": dt_to_str(self.eta),
+            "arrived_quantity": self.arrived_quantity,
+            "lost_quantity": self.lost_quantity,
+            "attempt": self.attempt,
+            "status": self.status.value,
+            "superseded_by": self.superseded_by,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ShipmentPart":
+        return cls(
+            part_id=data["part_id"],
+            tracking_number=data["tracking_number"],
+            quantity=float(data["quantity"]),
+            shipped_at=dt_from_str(data["shipped_at"]),
+            eta=dt_from_str(data["eta"]),
+            arrived_quantity=float(data.get("arrived_quantity", 0.0)),
+            lost_quantity=float(data.get("lost_quantity", 0.0)),
+            attempt=int(data.get("attempt", 1)),
+            status=ShipmentPartStatus(data["status"]),
+            superseded_by=data.get("superseded_by"),
+        )
+
+
+@dataclass
 class Shipment:
-    """发运单：支持分批到货与在途损耗。"""
+    """发运单：一张预占台账对应一张发运单，可拆为多个追踪批次。
+
+    到货与损耗数量是各分批的汇总；整单状态由分批状态聚合得出，
+    任意一批在途、部分到货或失败待重试时，发运单都不算关闭。
+    """
 
     shipment_id: str
     booking_id: str
@@ -507,9 +589,30 @@ class Shipment:
     quantity: float
     shipped_at: datetime
     eta: datetime
+    parts: list[ShipmentPart] = field(default_factory=list)
     arrived_quantity: float = 0.0
     lost_quantity: float = 0.0
     status: ShipmentStatus = ShipmentStatus.IN_TRANSIT
+
+    def roll_up(self) -> None:
+        """根据各分批重新汇总到货/损耗数量与整单状态。"""
+        self.arrived_quantity = round(sum(p.arrived_quantity for p in self.parts), 6)
+        self.lost_quantity = round(sum(p.lost_quantity for p in self.parts), 6)
+        earliest = min((p.shipped_at for p in self.parts), default=self.shipped_at)
+        self.shipped_at = earliest
+        open_parts = [p for p in self.parts if not p.resolved]
+        if open_parts:
+            self.status = (
+                ShipmentStatus.PARTIALLY_ARRIVED if self.arrived_quantity > QTY_EPS else ShipmentStatus.IN_TRANSIT
+            )
+            # ETA 取未关闭批次中的最晚预计到货时间
+            self.eta = max(p.eta for p in open_parts)
+        elif any(p.status == ShipmentPartStatus.CLOSED_WITH_LOSS for p in self.parts):
+            self.status = ShipmentStatus.CLOSED_WITH_LOSS
+            self.eta = max(p.eta for p in self.parts)
+        else:
+            self.status = ShipmentStatus.ARRIVED
+            self.eta = max(p.eta for p in self.parts)
 
     @property
     def remaining(self) -> float:
@@ -517,7 +620,20 @@ class Shipment:
 
     @property
     def closed(self) -> bool:
-        return self.status in (ShipmentStatus.ARRIVED, ShipmentStatus.CLOSED_WITH_LOSS)
+        """所有分批均已了结（无在途、无失败待重试）且无剩余量。"""
+        return all(p.resolved for p in self.parts) and self.remaining <= QTY_EPS
+
+    def active_parts(self) -> list[ShipmentPart]:
+        """仍可登记到货/损耗的分批。"""
+        return [p for p in self.parts if p.status in ACTIVE_PART_STATUSES]
+
+    def find_part(self, part_id: str | None = None, tracking_number: str | None = None) -> ShipmentPart | None:
+        for part in self.parts:
+            if part_id is not None and part.part_id == part_id:
+                return part
+            if tracking_number is not None and part.tracking_number == tracking_number:
+                return part
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -528,6 +644,7 @@ class Shipment:
             "quantity": self.quantity,
             "shipped_at": dt_to_str(self.shipped_at),
             "eta": dt_to_str(self.eta),
+            "parts": [p.to_dict() for p in self.parts],
             "arrived_quantity": self.arrived_quantity,
             "lost_quantity": self.lost_quantity,
             "status": self.status.value,
@@ -535,6 +652,40 @@ class Shipment:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Shipment":
+        if data.get("parts"):
+            parts = [ShipmentPart.from_dict(p) for p in data["parts"]]
+            shipment = cls(
+                shipment_id=data["shipment_id"],
+                booking_id=data["booking_id"],
+                batch_id=data["batch_id"],
+                material_id=data["material_id"],
+                quantity=float(data["quantity"]),
+                shipped_at=dt_from_str(data["shipped_at"]),
+                eta=dt_from_str(data["eta"]),
+                parts=parts,
+            )
+            shipment.roll_up()
+            return shipment
+        # 向后兼容：无分批记录的旧行按单一在途/已关闭分批还原
+        status = ShipmentStatus(data["status"])
+        part_status = {
+            ShipmentStatus.IN_TRANSIT: ShipmentPartStatus.IN_TRANSIT,
+            ShipmentStatus.PARTIALLY_ARRIVED: ShipmentPartStatus.PARTIALLY_ARRIVED,
+            ShipmentStatus.ARRIVED: ShipmentPartStatus.ARRIVED,
+            ShipmentStatus.CLOSED_WITH_LOSS: ShipmentPartStatus.CLOSED_WITH_LOSS,
+        }[status]
+        arrived = float(data.get("arrived_quantity", 0.0))
+        lost = float(data.get("lost_quantity", 0.0))
+        part = ShipmentPart(
+            part_id=f"{data['shipment_id']}-p1",
+            tracking_number=data.get("tracking_number", f"{data['shipment_id']}-TRK1"),
+            quantity=float(data["quantity"]),
+            shipped_at=dt_from_str(data["shipped_at"]),
+            eta=dt_from_str(data["eta"]),
+            arrived_quantity=arrived,
+            lost_quantity=lost,
+            status=part_status,
+        )
         return cls(
             shipment_id=data["shipment_id"],
             booking_id=data["booking_id"],
@@ -543,9 +694,10 @@ class Shipment:
             quantity=float(data["quantity"]),
             shipped_at=dt_from_str(data["shipped_at"]),
             eta=dt_from_str(data["eta"]),
-            arrived_quantity=float(data.get("arrived_quantity", 0.0)),
-            lost_quantity=float(data.get("lost_quantity", 0.0)),
-            status=ShipmentStatus(data["status"]),
+            parts=[part],
+            arrived_quantity=arrived,
+            lost_quantity=lost,
+            status=status,
         )
 
 

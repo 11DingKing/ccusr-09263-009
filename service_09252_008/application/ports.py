@@ -66,3 +66,35 @@ class SequentialIdGenerator:
         with self._lock:
             self._counters[prefix] = self._counters.get(prefix, 0) + 1
             return f"{prefix}_{self._counters[prefix]:04d}"
+
+
+class TrackingNumberGenerator(Protocol):
+    """发运追踪号生成端口：每个分批发运批次签发唯一追踪号。"""
+
+    def new_tracking_number(self, shipment_id: str, attempt: int) -> str:
+        ...
+
+
+class UuidTrackingNumberGenerator:
+    """生产环境追踪号：承运商风格前缀 + 随机段，Python 生成后随批次持久化。"""
+
+    def __init__(self, prefix: str = "TRK") -> None:
+        self._prefix = prefix
+
+    def new_tracking_number(self, shipment_id: str, attempt: int) -> str:
+        token = uuid.uuid4().hex.upper()
+        return f"{self._prefix}-{token[:4]}{token[4:8]}{token[8:12]}-{attempt}"
+
+
+class SequentialTrackingNumberGenerator:
+    """测试用确定性追踪号：``TRK-0001`` 起顺序签发。"""
+
+    def __init__(self, prefix: str = "TRK") -> None:
+        self._prefix = prefix
+        self._lock = threading.Lock()
+        self._counter = 0
+
+    def new_tracking_number(self, shipment_id: str, attempt: int) -> str:
+        with self._lock:
+            self._counter += 1
+            return f"{self._prefix}-{self._counter:04d}"

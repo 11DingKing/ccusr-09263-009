@@ -111,9 +111,28 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         lambda body, hdr: bookings.ship(hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)),
     )
     router.add(
+        "GET",
+        "/shipments/{shipment_id}",
+        lambda body, hdr: bookings.get_shipment(hdr["__path__"]["shipment_id"]),
+    )
+    router.add(
         "POST",
         "/shipments/{shipment_id}/arrivals",
         lambda body, hdr: bookings.record_arrival(hdr["__path__"]["shipment_id"], with_idempotency_key(body, hdr)),
+    )
+    router.add(
+        "POST",
+        "/shipments/{shipment_id}/failures",
+        lambda body, hdr: bookings.report_part_failure(
+            hdr["__path__"]["shipment_id"], with_idempotency_key(body, hdr)
+        ),
+    )
+    router.add(
+        "POST",
+        "/shipments/{shipment_id}/retries",
+        lambda body, hdr: bookings.retry_part(
+            hdr["__path__"]["shipment_id"], with_idempotency_key(body, hdr)
+        ),
     )
     router.add(
         "POST",
