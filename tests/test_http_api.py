@@ -112,6 +112,98 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn("expired_locks", body)
         self.assertIn("expired_quotes", body)
 
+    def test_split_shipment_fail_and_retry_over_http(self) -> None:
+        apply_body = {
+            "institution": "河西职业学院",
+            "package_id": self.ids["package_id"],
+            "mentor_id": self.ids["mentor_id"],
+            "resource_id": self.ids["resource_id"],
+            "window_id": self.ids["window_id"],
+            "seats": 4,
+            "slot_start": "2026-10-01T06:00:00+00:00",
+            "slot_end": "2026-10-01T08:00:00+00:00",
+        }
+        status, applied = self._request(
+            "POST", "/bookings", apply_body, headers={"Idempotency-Key": "http-split-apply"}
+        )
+        self.assertEqual(status, 201)
+        booking_id = applied["booking_id"]
+        self._request("POST", f"/bookings/{booking_id}/quote", {})
+        self._request("POST", f"/bookings/{booking_id}/lock", {}, headers={"Idempotency-Key": "http-split-lock"})
+        status, shipped = self._request(
+            "POST", f"/bookings/{booking_id}/ship", {}, headers={"Idempotency-Key": "http-split-ship"}
+        )
+        self.assertEqual(status, 200)
+        dye = next(s for s in shipped["shipments"] if s["material_id"] == "dye")  # 4 * 0.5 = 2.0
+        shipment_id = dye["shipment_id"]
+
+        status, split = self._request(
+            "POST",
+            f"/shipments/{shipment_id}/split",
+            {"quantities": [1.0, 1.0]},
+            headers={"Idempotency-Key": "http-split-do"},
+        )
+        self.assertEqual(status, 200)
+        parts = next(s for s in split["shipments"] if s["shipment_id"] == shipment_id)["parts"]
+        self.assertEqual([p["quantity"] for p in parts], [1.0, 1.0])
+        self.assertTrue(all(p["tracking_no"].startswith("trk_") for p in parts))
+
+        # 第一批到货，第二批失败
+        status, _ = self._request(
+            "POST", f"/shipments/{shipment_id}/parts/{parts[0]['part_id']}/arrivals", {"quantity": 1.0}
+        )
+        self.assertEqual(status, 200)
+        status, failed = self._request(
+            "POST",
+            f"/shipments/{shipment_id}/parts/{parts[1]['part_id']}/fail",
+            {"reason": "道路封闭"},
+        )
+        self.assertEqual(status, 200)
+        part = next(
+            p
+            for s in failed["shipments"]
+            if s["shipment_id"] == shipment_id
+            for p in s["parts"]
+            if p["part_id"] == parts[1]["part_id"]
+        )
+        self.assertEqual(part["status"], "FAILED")
+        old_tracking = part["tracking_no"]
+        self.assertEqual(failed["arrival_summary"]["by_material"]["dye"]["failed"], 1.0)
+
+        # 失败批直接到货 -> 409 invalid_state
+        status, body = self._request(
+            "POST", f"/shipments/{shipment_id}/parts/{parts[1]['part_id']}/arrivals", {"quantity": 1.0}
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "invalid_state")
+
+        # 独立重试：新追踪号
+        status, retried = self._request(
+            "POST",
+            f"/shipments/{shipment_id}/parts/{parts[1]['part_id']}/retry",
+            {},
+            headers={"Idempotency-Key": "http-split-retry"},
+        )
+        self.assertEqual(status, 200)
+        part = next(
+            p
+            for s in retried["shipments"]
+            if s["shipment_id"] == shipment_id
+            for p in s["parts"]
+            if p["part_id"] == parts[1]["part_id"]
+        )
+        self.assertEqual(part["attempt"], 2)
+        self.assertNotEqual(part["tracking_no"], old_tracking)
+        self.assertEqual(part["previous_tracking"], [old_tracking])
+
+        # 余量到货
+        status, arrived = self._request(
+            "POST", f"/shipments/{shipment_id}/parts/{parts[1]['part_id']}/arrivals", {"quantity": 1.0}
+        )
+        self.assertEqual(status, 200)
+        dye_view = next(s for s in arrived["shipments"] if s["shipment_id"] == shipment_id)
+        self.assertEqual(dye_view["status"], "ARRIVED")
+
 
 if __name__ == "__main__":
     unittest.main()

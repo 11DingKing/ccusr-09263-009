@@ -7,7 +7,7 @@
 ```
 service_09252_008/
 ├── domain/            # 领域模型层
-│   ├── models.py      #   课程包、导师、工坊资源、材料批次、接待窗口、预约、发运单、损耗、结算、事件
+│   ├── models.py      #   课程包、导师、工坊资源、材料批次、接待窗口、预约、发运单/分批发运批次、损耗、结算、事件
 │   ├── rules.py       #   纯规则：前置培训、容量、安全等级、互斥资源、材料分配、运输周期
 │   └── errors.py      #   领域错误（接口边界据此映射 HTTP 状态码）
 ├── application/       # 应用服务层
@@ -32,6 +32,9 @@ service_09252_008/
 - **发运后不可移动**：`SHIPPED` 及之后的状态拒绝改期；取消时已发运材料记损耗
   （`cancel_after_shipment`），未发运预占回补库存，并按申请先后释放候补。
 - **到货**：支持部分到货与在途损耗；发运单未关闭或到货不足时禁止签到。
+- **材料分批发运**：一张发运单可拆为多个批次，每批由 Python 生成独立追踪号并持久化；
+  单批失败只影响该批（`FAILED`），可凭幂等键独立重试（生成新追踪号、保留旧号履历与尝试次数），
+  其他批次照常到货；整单查询经 `arrival_summary` 汇总各材料实际到货/在途/失败/损耗数量。
 - **结算**：按实际出勤折算消耗；国内余料退回库存，跨境余料记损耗
   （`non_returnable_leftover`），课中损坏记 `damaged_in_use`。
 - **超时恢复**：过期锁定释放库存并晋级候补，过期报价退回待报价；
@@ -58,6 +61,11 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 | POST | `/bookings/{id}/ship` | 发运（需幂等键） |
 | POST | `/shipments/{id}/arrivals` | 到货（支持部分到货） |
 | POST | `/shipments/{id}/losses` | 在途损耗登记 |
+| POST | `/shipments/{id}/split` | 拆为分批发运（`quantities` 或 `part_count`，需幂等键） |
+| POST | `/shipments/{id}/parts/{pid}/fail` | 单批发运失败 |
+| POST | `/shipments/{id}/parts/{pid}/retry` | 失败批独立重试（需幂等键，生成新追踪号） |
+| POST | `/shipments/{id}/parts/{pid}/arrivals` | 按批到货 |
+| POST | `/shipments/{id}/parts/{pid}/losses` | 按批在途损耗 |
 | POST | `/bookings/{id}/checkin` | 签到 |
 | POST | `/bookings/{id}/settle` | 结算（`actual_attendance`、可选 `damaged`） |
 | POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗） |
@@ -75,7 +83,8 @@ python3 -m unittest discover -s tests -v
 
 覆盖：主流程端到端、前置培训/容量/安全/互斥/运输周期规则、跨时区、
 幂等重放、并发锁定（内存与 SQLite 双后端）、重启后超时恢复、
-部分到货与在途损耗、取消释放候补与损耗记录、HTTP 接口边界。
+部分到货与在途损耗、材料分批发运（追踪号持久化、单批失败独立重试、整单到货汇总、SQLite 重启恢复）、
+取消释放候补与损耗记录、HTTP 接口边界。
 
 ## 编译检查
 

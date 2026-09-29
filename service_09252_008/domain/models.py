@@ -100,6 +100,16 @@ class ShipmentStatus(str, Enum):
     CLOSED_WITH_LOSS = "CLOSED_WITH_LOSS"  # 剩余记损耗后关闭
 
 
+class ShipmentPartStatus(str, Enum):
+    """分批发运批次状态：失败批次可独立重试（重试生成新追踪号）。"""
+
+    IN_TRANSIT = "IN_TRANSIT"  # 已交运，在途（尚无到货）
+    PARTIALLY_ARRIVED = "PARTIALLY_ARRIVED"  # 本批部分到货，余量仍在途
+    ARRIVED = "ARRIVED"  # 已全部到货
+    FAILED = "FAILED"  # 本批发运失败，等待独立重试
+    CLOSED_WITH_LOSS = "CLOSED_WITH_LOSS"  # 余量记损耗后关闭
+
+
 #: 损耗原因
 LOSS_CANCEL_AFTER_SHIPMENT = "cancel_after_shipment"  # 发运后取消
 LOSS_IN_TRANSIT = "in_transit_loss"  # 在途灭失
@@ -497,8 +507,71 @@ class MaterialReservation:
 
 
 @dataclass
+class ShipmentPart:
+    """分批发运中的一个批次：独立追踪号与状态，失败可单独重试。
+
+    重试不换 ``part_id``，而是生成新追踪号并把旧号记入 ``previous_tracking``；
+    若批次部分到货后才失败，``arrived_quantity`` 保留，重试仅针对未到余量。
+    """
+
+    part_id: str
+    tracking_no: str
+    quantity: float  # 本批应交运数量
+    dispatched_at: datetime
+    arrived_quantity: float = 0.0
+    lost_quantity: float = 0.0
+    status: ShipmentPartStatus = ShipmentPartStatus.IN_TRANSIT
+    arrived_at: datetime | None = None
+    attempt: int = 1
+    previous_tracking: list[str] = field(default_factory=list)
+
+    @property
+    def remaining(self) -> float:
+        """本批尚未结清的数量（在途或等待重试）。"""
+        return self.quantity - self.arrived_quantity - self.lost_quantity
+
+    @property
+    def closed(self) -> bool:
+        return self.status in (ShipmentPartStatus.ARRIVED, ShipmentPartStatus.CLOSED_WITH_LOSS)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "part_id": self.part_id,
+            "tracking_no": self.tracking_no,
+            "quantity": self.quantity,
+            "dispatched_at": dt_to_str(self.dispatched_at),
+            "arrived_quantity": self.arrived_quantity,
+            "lost_quantity": self.lost_quantity,
+            "status": self.status.value,
+            "arrived_at": dt_to_str(self.arrived_at) if self.arrived_at else None,
+            "attempt": self.attempt,
+            "previous_tracking": list(self.previous_tracking),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ShipmentPart":
+        arrived_at = data.get("arrived_at")
+        return cls(
+            part_id=data["part_id"],
+            tracking_no=data["tracking_no"],
+            quantity=float(data["quantity"]),
+            dispatched_at=dt_from_str(data["dispatched_at"]),
+            arrived_quantity=float(data.get("arrived_quantity", 0.0)),
+            lost_quantity=float(data.get("lost_quantity", 0.0)),
+            status=ShipmentPartStatus(data["status"]),
+            arrived_at=dt_from_str(arrived_at) if arrived_at else None,
+            attempt=int(data.get("attempt", 1)),
+            previous_tracking=list(data.get("previous_tracking", [])),
+        )
+
+
+@dataclass
 class Shipment:
-    """发运单：支持分批到货与在途损耗。"""
+    """发运单：支持分批到货、在途损耗与材料分批发运。
+
+    ``parts`` 为空时为直发模式（发运即一张运单）；拆批后每个 :class:`ShipmentPart`
+    持有独立追踪号与状态，``arrived_quantity`` 始终等于各批到货量之和。
+    """
 
     shipment_id: str
     booking_id: str
@@ -510,6 +583,7 @@ class Shipment:
     arrived_quantity: float = 0.0
     lost_quantity: float = 0.0
     status: ShipmentStatus = ShipmentStatus.IN_TRANSIT
+    parts: list[ShipmentPart] = field(default_factory=list)
 
     @property
     def remaining(self) -> float:
@@ -518,6 +592,43 @@ class Shipment:
     @property
     def closed(self) -> bool:
         return self.status in (ShipmentStatus.ARRIVED, ShipmentStatus.CLOSED_WITH_LOSS)
+
+    @property
+    def is_split(self) -> bool:
+        """是否已拆为分批发运。"""
+        return bool(self.parts)
+
+    def get_part(self, part_id: str) -> ShipmentPart | None:
+        for part in self.parts:
+            if part.part_id == part_id:
+                return part
+        return None
+
+    def part_totals(self) -> dict[str, float]:
+        """汇总各批实际到货/在途/失败/损耗数量（拆批模式）。"""
+        arrived = sum(p.arrived_quantity for p in self.parts)
+        lost = sum(p.lost_quantity for p in self.parts)
+        active = (ShipmentPartStatus.IN_TRANSIT, ShipmentPartStatus.PARTIALLY_ARRIVED)
+        in_transit = sum(p.remaining for p in self.parts if p.status in active)
+        failed = sum(p.remaining for p in self.parts if p.status == ShipmentPartStatus.FAILED)
+        return {
+            "quantity": sum(p.quantity for p in self.parts),
+            "arrived": round(arrived, 6),
+            "in_transit": round(in_transit, 6),
+            "failed": round(failed, 6),
+            "lost": round(lost, 6),
+        }
+
+    def derive_status(self) -> ShipmentStatus:
+        """依据各批状态推导整单状态。"""
+        totals = self.part_totals()
+        outstanding = round(totals["in_transit"] + totals["failed"], 6)
+        if outstanding <= QTY_EPS:
+            # 所有批次均已结清（到货或记损耗关闭）
+            return ShipmentStatus.CLOSED_WITH_LOSS if totals["lost"] > QTY_EPS else ShipmentStatus.ARRIVED
+        if totals["arrived"] > QTY_EPS or totals["lost"] > QTY_EPS:
+            return ShipmentStatus.PARTIALLY_ARRIVED
+        return ShipmentStatus.IN_TRANSIT
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -531,6 +642,7 @@ class Shipment:
             "arrived_quantity": self.arrived_quantity,
             "lost_quantity": self.lost_quantity,
             "status": self.status.value,
+            "parts": [p.to_dict() for p in self.parts],
         }
 
     @classmethod
@@ -546,6 +658,7 @@ class Shipment:
             arrived_quantity=float(data.get("arrived_quantity", 0.0)),
             lost_quantity=float(data.get("lost_quantity", 0.0)),
             status=ShipmentStatus(data["status"]),
+            parts=[ShipmentPart.from_dict(p) for p in data.get("parts", [])],
         )
 
 

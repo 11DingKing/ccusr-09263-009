@@ -122,6 +122,39 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
             hdr["__path__"]["shipment_id"], with_idempotency_key(body, hdr)
         ),
     )
+
+    # 材料分批发运：拆批、单批失败/重试、按批到货与在途损耗
+    def _sid(hdr: dict[str, str]) -> str:
+        return hdr["__path__"]["shipment_id"]
+
+    def _pid(hdr: dict[str, str]) -> str:
+        return hdr["__path__"]["part_id"]
+
+    router.add(
+        "POST",
+        "/shipments/{shipment_id}/split",
+        lambda body, hdr: bookings.split_shipment(_sid(hdr), with_idempotency_key(body, hdr)),
+    )
+    router.add(
+        "POST",
+        "/shipments/{shipment_id}/parts/{part_id}/fail",
+        lambda body, hdr: bookings.fail_part(_sid(hdr), _pid(hdr), with_idempotency_key(body, hdr)),
+    )
+    router.add(
+        "POST",
+        "/shipments/{shipment_id}/parts/{part_id}/retry",
+        lambda body, hdr: bookings.retry_part(_sid(hdr), _pid(hdr), with_idempotency_key(body, hdr)),
+    )
+    router.add(
+        "POST",
+        "/shipments/{shipment_id}/parts/{part_id}/arrivals",
+        lambda body, hdr: bookings.record_part_arrival(_sid(hdr), _pid(hdr), with_idempotency_key(body, hdr)),
+    )
+    router.add(
+        "POST",
+        "/shipments/{shipment_id}/parts/{part_id}/losses",
+        lambda body, hdr: bookings.record_part_loss(_sid(hdr), _pid(hdr), with_idempotency_key(body, hdr)),
+    )
     router.add(
         "POST",
         "/bookings/{booking_id}/checkin",
